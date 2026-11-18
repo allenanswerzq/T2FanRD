@@ -1,0 +1,47 @@
+# Fan curves for the 13-inch 2020 MacBook Pro (MacBookPro16,2).
+#
+# Each curve maps its hottest sensor from 0% at low to 100% at high of the fan
+# range. The fans follow the hottest curve: they speed up at once and slow
+# down by ramp_down percent per second. Sensor names come from
+# `t2fanrd --list-sensors`; smc:* are the T2 SMC's sensors.
+
+interval = 0.5
+stale_after = 5.0
+
+[output]
+smoothing = 0.0
+deadband = 1.0
+ramp_up = 0.0
+ramp_down = 3.0
+
+# The CPU die: guards against throttling during bursts, averaged over 2 s so
+# a short spike doesn't spin the fans up.
+[[curve]]
+name = "cpu"
+sensors = ["coretemp:Package id 0"]
+low = 85.0
+high = 95.0
+average = 2.0
+hysteresis = 3.0
+
+# The heatsinks: heat that has built up and needs to leave the machine. Th2H
+# sits near 53 C at light load (about 11 W, with the GPU busy or the battery
+# charging), so the curve starts above that; long builds reach 60 C.
+[[curve]]
+name = "heatsink"
+sensors = ["smc:Th1H", "smc:Th2H"]
+low = 52.0
+high = 62.0
+average = 10.0
+hysteresis = 1.0
+
+# The case surface: what you feel on your hands and lap. It sits at 43-45 C
+# while charging or with the GPU busy, and the fans cool it only slowly, so
+# this curve starts late and leaves everyday warmth to the other two.
+[[curve]]
+name = "surface"
+sensors = ["smc:Ts0S", "smc:Ts1S", "smc:Ts2S"]
+low = 43.0
+high = 48.0
+average = 30.0
+hysteresis = 0.5

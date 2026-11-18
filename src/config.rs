@@ -1,141 +1,113 @@
-use std::{io::ErrorKind, num::NonZeroUsize, path::PathBuf, str::FromStr};
+//! The config file: how often to update, how the fans move, and the curves
+//! that turn temperatures into fan speed.
 
-use nonempty::NonEmpty as NonEmptyVec;
+use std::path::Path;
 
-use crate::{fan_controller::FanController, Error, Result};
+use anyhow::{ensure, Context, Result};
+use serde::Deserialize;
 
-#[cfg(debug_assertions)]
-const CONFIG_FILE: &str = "./t2fand.conf";
-#[cfg(not(debug_assertions))]
-const CONFIG_FILE: &str = "/etc/t2fand.conf";
-
-#[derive(Clone, Copy, Debug)]
-pub enum SpeedCurve {
-    Linear,
-    Exponential,
-    Logarithmic,
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// Seconds between updates.
+    #[serde(default = "default_interval")]
+    pub interval: f64,
+    /// Seconds without a good reading before a sensor counts as failed and
+    /// the fans go to full speed.
+    #[serde(default = "default_stale_after")]
+    pub stale_after: f64,
+    #[serde(default)]
+    pub output: OutputConfig,
+    #[serde(rename = "curve")]
+    pub curves: Vec<CurveConfig>,
 }
 
-impl std::fmt::Display for SpeedCurve {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Linear => f.write_str("linear"),
-            Self::Exponential => f.write_str("exponential"),
-            Self::Logarithmic => f.write_str("logarithmic"),
-        }
-    }
+/// How the fan speed follows the hottest curve, in percent of each fan's
+/// RPM range. Same model as fan2go's `direct` control algorithm.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputConfig {
+    /// Low-pass time constant in seconds; 0 follows the curves directly.
+    pub smoothing: f64,
+    /// Changes smaller than this many percent are not written.
+    pub deadband: f64,
+    /// Percent per second the fans may speed up; 0 means at once.
+    pub ramp_up: f64,
+    /// Percent per second the fans may slow down; 0 means at once.
+    pub ramp_down: f64,
 }
 
-impl FromStr for SpeedCurve {
-    type Err = ();
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "linear" => Self::Linear,
-            "exponential" => Self::Exponential,
-            "logarithmic" => Self::Logarithmic,
-            _ => return Err(()),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct FanConfig {
-    pub low_temp: u8,
-    pub high_temp: u8,
-    pub speed_curve: SpeedCurve,
-    pub always_full_speed: bool,
-}
-
-impl FanConfig {
-    fn write_property<'a>(
-        self,
-        setter: &'a mut ini::SectionSetter<'a>,
-    ) -> &'a mut ini::SectionSetter<'a> {
-        setter
-            .set("low_temp", self.low_temp.to_string())
-            .set("high_temp", self.high_temp.to_string())
-            .set("speed_curve", self.speed_curve.to_string())
-            .set("always_full_speed", self.always_full_speed.to_string())
-    }
-}
-
-impl Default for FanConfig {
+impl Default for OutputConfig {
     fn default() -> Self {
         Self {
-            low_temp: 55,
-            high_temp: 75,
-            speed_curve: SpeedCurve::Linear,
-            always_full_speed: false,
+            smoothing: 0.0,
+            deadband: 1.0,
+            ramp_up: 0.0,
+            ramp_down: 3.0,
         }
     }
 }
 
-impl TryFrom<&ini::Properties> for FanConfig {
-    type Error = Error;
+/// One temperature source and the speed it asks for: 0% at `low` and below,
+/// 100% at `high` and above, a straight line between.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurveConfig {
+    pub name: String,
+    /// `chip:label`, as `t2fanrd --list-sensors` prints them. The curve uses
+    /// the hottest one.
+    pub sensors: Vec<String>,
+    pub low: f64,
+    pub high: f64,
+    /// Time constant in seconds of the moving average; 0 uses each reading.
+    #[serde(default)]
+    pub average: f64,
+    /// Degrees a temperature must fall before the curve follows it down.
+    #[serde(default)]
+    pub hysteresis: f64,
+}
 
-    fn try_from(properties: &ini::Properties) -> Result<Self, Self::Error> {
-        fn get_value<V: FromStr>(properties: &ini::Properties, key: &'static str) -> Result<V> {
-            let value_str = properties.get(key).ok_or(Error::MissingConfigValue(key))?;
-            value_str
-                .parse()
-                .map_err(|_| Error::InvalidConfigValue(key))
+fn default_interval() -> f64 {
+    0.5
+}
+
+fn default_stale_after() -> f64 {
+    5.0
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let config: Self =
+            toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(self.interval > 0.0, "interval must be above 0");
+        ensure!(
+            self.stale_after >= self.interval,
+            "stale_after must be at least interval"
+        );
+        let o = self.output;
+        ensure!(
+            [o.smoothing, o.deadband, o.ramp_up, o.ramp_down]
+                .iter()
+                .all(|v| *v >= 0.0),
+            "output values must not be negative"
+        );
+        ensure!(!self.curves.is_empty(), "add at least one [[curve]]");
+        for c in &self.curves {
+            ensure!(!c.sensors.is_empty(), "curve {} has no sensors", c.name);
+            ensure!(c.low < c.high, "curve {}: low must be below high", c.name);
+            ensure!(
+                c.average >= 0.0 && c.hysteresis >= 0.0,
+                "curve {}: average and hysteresis must not be negative",
+                c.name
+            );
         }
-
-        Ok(Self {
-            low_temp: get_value(properties, "low_temp")?,
-            high_temp: get_value(properties, "high_temp")?,
-            speed_curve: get_value(properties, "speed_curve")?,
-            always_full_speed: get_value(properties, "always_full_speed")?,
-        })
+        Ok(())
     }
-}
-
-fn parse_config_file(file_raw: &str, fan_count: NonZeroUsize) -> Result<Vec<FanConfig>> {
-    let file = ini::Ini::load_from_str(file_raw)?;
-    let mut configs = Vec::with_capacity(fan_count.get());
-
-    for i in 1..=fan_count.get() {
-        let section = file
-            .section(Some(format!("Fan{i}")))
-            .ok_or(Error::MissingFanConfig(i))?;
-
-        configs.push(FanConfig::try_from(section)?);
-    }
-
-    Ok(configs)
-}
-
-fn generate_config_file(fan_count: NonZeroUsize) -> Result<Vec<FanConfig>> {
-    let mut config_file = ini::Ini::new();
-    let mut configs = Vec::with_capacity(fan_count.get());
-    for i in 1..=fan_count.get() {
-        let config = FanConfig::default();
-        configs.push(config);
-
-        let mut setter = config_file.with_section(Some(format!("Fan{i}")));
-        config.write_property(&mut setter);
-    }
-
-    config_file
-        .write_to_file(CONFIG_FILE)
-        .map_err(Error::ConfigCreate)?;
-
-    Ok(configs)
-}
-
-pub fn load_fan_configs(fan_paths: NonEmptyVec<PathBuf>) -> Result<NonEmptyVec<FanController>> {
-    let fan_count = fan_paths.len_nonzero();
-    let configs = match std::fs::read_to_string(CONFIG_FILE) {
-        Ok(file_raw) => parse_config_file(&file_raw, fan_count)?,
-        Err(err) if err.kind() == ErrorKind::NotFound => generate_config_file(fan_count)?,
-        Err(err) => return Err(Error::ConfigRead(err)),
-    };
-
-    let fans = fan_paths
-        .into_iter()
-        .zip(configs)
-        .map(|(path, config)| FanController::new(path, config))
-        .collect::<Result<_>>()?;
-
-    Ok(NonEmptyVec::from_vec(fans).unwrap())
 }

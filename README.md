@@ -1,53 +1,63 @@
 # T2FanRD
 
-Simple Fan Daemon for T2 Macs, rewritten from the [original Python version](https://github.com/NoaHimesaka1873/t2fand).
+A fork of [GnomedDev/t2fanrd](https://github.com/GnomedDev/t2fanrd), which is
+archived.
 
-## Archived
+Fan daemon for T2 Macs. It keeps the Mac cool by watching several
+temperatures, not just the CPU: each curve looks at the hottest of its
+sensors, and the fans follow the hottest curve. The control model follows
+[fan2go](https://github.com/markusressel/fan2go):
 
-This repository has been archived due to it's purpose being fulfilled, with recent kernels supporting the standard hwmon interface.
-
-Standard userspace fan daemons should work, although `1` needs to be written to `/sys/module/macsmc_hwmon/parameters/fan_control` first.
-
-For those who still want to use the `t2fand` config format or behaviour, see the following fork: https://github.com/sharpenedblade/T2FanRD
+- Each curve averages its sensor over its own time span, so a short CPU spike
+  doesn't spin the fans up, and slow heat in the heatsinks or case still does.
+- Hysteresis keeps a curve from following a falling temperature at once.
+- The fans speed up at once and slow down at `ramp_down` percent per second.
+- A sensor without a good reading for `stale_after` seconds sends the fans to
+  full speed.
+- After sleep, or when anything else changes the fans, the daemon takes them
+  back. On exit, and on errors, it hands them back to the SMC.
 
 ## Compilation
 `cargo build --release`
 
-## Installation
-### Standard
-1. Copy the `target/release/t2fanrd` executable to wherever your distro wants executables to be run by root.
-2. Setup the executable to be run automatically at startup, like via a [systemd service](https://github.com/t2linux/fedora/blob/2947fdc909a35f04eb936a4f9c0f33fe4e52d9c2/t2fanrd/t2fanrd.service).
+## Usage
 
-### NixOS
-Add this repo to your flake inputs, and the module `<name-of-input>.nixosModule.t2fanrd` to your imports.
+```
+t2fanrd [--config /etc/t2fanrd.toml] [--trace] [--dry-run] [--list-sensors]
+```
+
+- `--list-sensors` prints every sensor a curve can use, as `chip:label`. The
+  T2 SMC's sensors are `smc:*`; the others come from hwmon (`coretemp:Package id 0`).
+- `--dry-run` computes the fan speeds and prints them every second without
+  touching the fans, so it runs next to the daemon and without root.
+- `--trace` prints the same lines while it controls the fans.
 
 ## Configuration
-### Standard
-Initial configuration will be done automatically.
 
-For manual config, the config file can be found at `/etc/t2fand.conf`.
+`/etc/t2fanrd.toml`; [t2fanrd.toml](t2fanrd.toml) is the config for the
+13-inch 2020 MacBook Pro.
 
-There's four options for each fan.
-|        Key        |                            Value                            |
-|:-----------------:|:-----------------------------------------------------------:|
-|      low_temp     |        Temperature that will trigger higher fan speed       |
-|     high_temp     |         Temperature that will trigger max fan speed         |
-|    speed_curve    |   Three options present. Will be explained in table below.  |
-| always_full_speed | if set "true", the fan will be at max speed no matter what. |
+| Key | Default | Meaning |
+|---|---|---|
+| `interval` | `0.5` | Seconds between updates. |
+| `stale_after` | `5.0` | Seconds without a good reading before the fans go to full speed. |
+| `output.smoothing` | `0` | Low-pass time constant in seconds on the fan speed. |
+| `output.deadband` | `1` | Changes smaller than this many percent are not written. |
+| `output.ramp_up` | `0` | Percent per second the fans may speed up; 0 is at once. |
+| `output.ramp_down` | `3` | Percent per second the fans may slow down; 0 is at once. |
 
-For `speed_curve`, there's three options.
-|     Key     |                   Value                   |
-|:-----------:|:-----------------------------------------:|
-|    linear   |     Fan speed will be scaled linearly.    |
-| exponential |  Fan speed will be scaled exponentially.  |
-| logarithmic | Fan speed will be scaled logarithmically. |
+Each `[[curve]]` maps its hottest sensor from 0% of every fan's RPM range at
+`low` to 100% at `high`:
 
-Here's an image to better explain this. (Red: linear, blue: exponential, green: logarithmic)
-![Image of fan curve graphs](https://user-images.githubusercontent.com/39993457/233580720-cfdaba12-a2d8-430c-87a2-15209dcfec6d.png)
+| Key | Meaning |
+|---|---|
+| `name` | Shown in `--trace` and in errors. |
+| `sensors` | `chip:label` names from `--list-sensors`. |
+| `low`, `high` | Degrees Celsius. |
+| `average` | Time constant in seconds of the moving average; 0 uses each reading. |
+| `hysteresis` | Degrees a temperature must fall before the curve follows it down. |
 
 ### NixOS
-Find out how many fans you have (using lm_sensors for example, as in: `$ nix-shell -p lm_sensors --run "sensors | grep fan"`).
-
-Configure each fan with `services.t2fanrd.config.<name-of-fan>` using the options from the Standard configuration above. See the example declared with the option in the flake.
-
-Start the systemd service with `services.t2fanrd.enable = true;`.
+Add this repo to your flake inputs, the module `<name-of-input>.nixosModules.t2fanrd`
+to your imports, and set `services.t2fanrd.enable = true;`. `services.t2fanrd.settings`
+holds the config, with the MacBook Pro config above as its default.

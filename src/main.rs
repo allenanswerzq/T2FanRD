@@ -1,223 +1,202 @@
-#![warn(rust_2018_idioms)]
-#![warn(clippy::pedantic)]
-#![allow(
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::similar_names,
-    clippy::module_name_repetitions
-)]
-
-use std::{
-    io::{ErrorKind, Read, Seek},
-    path::PathBuf,
-    process::ExitCode,
-    sync::{atomic::AtomicBool, Arc},
-};
-
-use arraydeque::ArrayDeque;
-use fan_controller::FanController;
-use nonempty::NonEmpty as NonEmptyVec;
-use signal_hook::consts::{SIGINT, SIGTERM};
-
-use config::load_fan_configs;
-use error::{Error, Result};
+//! Fan daemon for T2 Macs. Each curve watches the hottest of its sensors;
+//! the fans follow the hottest curve, speed up at once and slow down
+//! gently. See README.md and t2fanrd.toml.
 
 mod config;
-mod error;
-mod fan_controller;
+mod control;
+mod curve;
+mod fan;
+mod sensor;
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("This tool is only developed for Linux systems.");
+use std::{
+    fs::File,
+    io::Write,
+    os::fd::AsRawFd,
+    path::PathBuf,
+    process::ExitCode,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
-#[cfg(debug_assertions)]
-const PID_FILE: &str = "t2fand.pid";
-#[cfg(not(debug_assertions))]
+use anyhow::{bail, Context, Result};
+use clap::Parser;
+use signal_hook::consts::{SIGINT, SIGTERM};
+
+use crate::{config::Config, control::Control, curve::Curve, fan::Fans};
+
 const PID_FILE: &str = "/run/t2fand.pid";
+const TRACE_EVERY: Duration = Duration::from_secs(1);
 
-fn get_current_euid() -> libc::uid_t {
-    // SAFETY: FFI call with no preconditions
-    unsafe { libc::geteuid() }
-}
-
-fn find_fan_paths() -> Result<NonEmptyVec<PathBuf>> {
-    // APP0001:00/fan1_label
-    let fan = glob::glob("/sys/devices/pci*/*/*/*/APP0001:00/fan*")?
-        .filter_map(Result::ok)
-        .find(|p| p.exists())
-        .ok_or(Error::NoFan)?;
-
-    // APP0001:00
-    let first_fan_path = fan.parent().ok_or(Error::NoFan)?;
-    // APP0001:00/fan*_input
-    let fan_glob = first_fan_path.display().to_string() + "/fan*_input";
-    // APP0001:00/fan1
-    let fans = glob::glob(&fan_glob)?
-        .filter_map(Result::ok)
-        .filter_map(|mut path| {
-            let file_name = path.file_name()?.to_str()?;
-            let fan_name = file_name.strip_suffix("_input")?;
-            let fan_name_owned = fan_name.to_owned();
-            path.set_file_name(fan_name_owned);
-            Some(path)
-        });
-
-    NonEmptyVec::collect(fans).ok_or(Error::NoFan)
-}
-
-fn check_pid_file() -> Result<()> {
-    match std::fs::read_to_string(PID_FILE) {
-        Ok(pid) => {
-            let mut proc_path = std::path::PathBuf::new();
-            proc_path.push("/proc");
-            proc_path.push(pid);
-
-            if proc_path.exists() {
-                return Err(Error::AlreadyRunning);
-            }
-        }
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => return Err(Error::PidRead(err)),
-    }
-
-    let current_pid = std::process::id().to_string();
-    std::fs::write(PID_FILE, current_pid).map_err(Error::PidWrite)
-}
-
-fn read_temp_file(temp_file: &mut std::fs::File, temp_buf: &mut String) -> Result<u8> {
-    temp_file
-        .read_to_string(temp_buf)
-        .map_err(Error::TempRead)?;
-
-    temp_file.rewind().map_err(Error::TempSeek)?;
-
-    let temp = temp_buf.trim_end().parse::<u32>().map_err(Error::TempParse);
-    temp_buf.clear();
-    temp.map(|t| (t / 1000) as u8)
-}
-
-fn find_temp_file(temps: glob::Paths, temp_buf: &mut String) -> Option<std::fs::File> {
-    for temp_path_res in temps {
-        let Ok(temp_path) = temp_path_res else {
-            eprintln!("Unable to read glob path");
-            continue;
-        };
-
-        let Ok(mut temp_file) = std::fs::File::open(temp_path) else {
-            eprintln!("Unable to open temperature sensor");
-            continue;
-        };
-
-        if read_temp_file(&mut temp_file, temp_buf).is_ok() {
-            return Some(temp_file);
-        }
-    }
-
-    None
-}
-
-fn find_cpu_temp_file(temp_buf: &mut String) -> Result<std::fs::File> {
-    let temps = glob::glob("/sys/devices/platform/coretemp.0/hwmon/hwmon*/temp1_input")?;
-    find_temp_file(temps, temp_buf).ok_or(Error::NoCpu)
-}
-
-fn find_gpu_temp_file(temp_buf: &mut String) -> Result<Option<std::fs::File>> {
-    let temps = glob::glob("/sys/class/drm/card0/device/hwmon/hwmon*/temp1_input")?;
-    Ok(find_temp_file(temps, temp_buf))
+#[derive(Parser)]
+#[command(version, about = "Fan daemon for T2 Macs")]
+struct Cli {
+    /// Config file.
+    #[arg(long, default_value = "/etc/t2fanrd.toml")]
+    config: PathBuf,
+    /// Compute and print fan speeds without touching the fans.
+    #[arg(long)]
+    dry_run: bool,
+    /// Print temperatures and fan speeds every second.
+    #[arg(long)]
+    trace: bool,
+    /// Print every sensor a curve can use, then exit.
+    #[arg(long)]
+    list_sensors: bool,
 }
 
 fn main() -> ExitCode {
-    match real_main() {
+    match run(&Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("Error: {err}");
+            eprintln!("Error: {err:#}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn start_temp_loop(
-    mut temp_buffer: String,
-    mut cpu_temp_file: std::fs::File,
-    mut gpu_temp_file: Option<std::fs::File>,
-    fans: &NonEmptyVec<FanController>,
-) -> Result<()> {
-    let cancellation_token = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGINT, cancellation_token.clone()).map_err(Error::Signal)?;
-    signal_hook::flag::register(SIGTERM, cancellation_token.clone()).map_err(Error::Signal)?;
-
-    let mut last_temp = 0;
-    let mut temps = ArrayDeque::<u8, 50, arraydeque::Wrapping>::new();
-    let mut was_long_sleep = false;
-    while !cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
-        let cpu_temp = read_temp_file(&mut cpu_temp_file, &mut temp_buffer)?;
-        let temp = if let Some(gpu_temp_file) = &mut gpu_temp_file {
-            let gpu_temp = read_temp_file(gpu_temp_file, &mut temp_buffer)?;
-            if gpu_temp > cpu_temp {
-                gpu_temp
-            } else {
-                cpu_temp
-            }
-        } else {
-            cpu_temp
-        };
-
-        temps.push_back(temp);
-        if was_long_sleep {
-            // Avoid messing up the mean due to the longer sleep.
-            for _ in 0..9 {
-                temps.push_back(temp);
-            }
+fn run(cli: &Cli) -> Result<()> {
+    if cli.list_sensors {
+        for (name, temp) in sensor::list()? {
+            let temp = temp.map_or_else(|| "?".to_owned(), |t| format!("{t:.1} C"));
+            println!("{name:<24} {temp:>8}");
         }
-
-        let sum_temp: u16 = temps.iter().map(|t| *t as u16).sum();
-        let mean_temp = sum_temp / (temps.len() as u16);
-        if mean_temp == last_temp {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            was_long_sleep = true;
-        } else {
-            last_temp = mean_temp;
-            for fan in fans {
-                fan.set_speed(fan.calc_speed(mean_temp as u8))?;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            was_long_sleep = false;
-        }
+        return Ok(());
     }
 
+    let config = Config::load(&cli.config)?;
+    let mut curves = config
+        .curves
+        .iter()
+        .map(Curve::open)
+        .collect::<Result<Vec<_>>>()?;
+    let mut control = Control::new(config.output);
+
+    let _lock = if cli.dry_run { None } else { Some(lock()?) };
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [SIGINT, SIGTERM] {
+        signal_hook::flag::register(signal, stop.clone()).context("cannot handle signals")?;
+    }
+
+    let mut fans = Fans::open(&sensor::smc_dir()?, !cli.dry_run)?;
+    let interval = Duration::from_secs_f64(config.interval);
+    let stale_after = Duration::from_secs_f64(config.stale_after);
+    let mut sleep_clock = SleepClock::new();
+    let mut failure: Option<String> = None;
+    let mut traced: Option<Instant> = None;
+
+    while !stop.load(Ordering::Relaxed) {
+        let now = Instant::now();
+        if let Some(slept) = sleep_clock.slept() {
+            println!(
+                "Woke up after {}s of sleep; taking the fans back",
+                slept.as_secs()
+            );
+            curves.iter_mut().for_each(Curve::reset);
+            control.reset();
+            fans.reclaim()?;
+        }
+
+        let mut demand = 0.0_f64;
+        let mut failed = None;
+        for curve in &mut curves {
+            match curve.update(now, stale_after) {
+                Ok(percent) => demand = demand.max(percent),
+                Err(err) => failed = failed.or(Some(err)),
+            }
+        }
+        let percent = if let Some(err) = failed {
+            if failure.as_ref() != Some(&err) {
+                eprintln!("Sensor failed, fans at full speed: {err}");
+            }
+            failure = Some(err);
+            control.hold(now, 100.0);
+            100.0
+        } else {
+            if failure.take().is_some() {
+                println!("Sensors work again");
+            }
+            control.update(now, demand)
+        };
+        fans.set(percent, now)?;
+
+        if (cli.trace || cli.dry_run) && traced.is_none_or(|t| now.duration_since(t) >= TRACE_EVERY)
+        {
+            traced = Some(now);
+            trace(&curves, demand, percent, &fans);
+        }
+        std::thread::sleep(interval.saturating_sub(now.elapsed()));
+    }
+    if !cli.dry_run {
+        println!("Stopping; the SMC controls the fans again");
+    }
     Ok(())
 }
 
-fn real_main() -> Result<()> {
-    if get_current_euid() != 0 {
-        return Err(Error::NotRoot);
+fn trace(curves: &[Curve], demand: f64, percent: f64, fans: &Fans) {
+    let mut line = String::new();
+    for c in curves {
+        line += &format!("{} {:.1}C {:3.0}%  ", c.name(), c.temp, c.percent);
+    }
+    line += &format!("| want {demand:3.0}% set {percent:5.1}% |");
+    for f in &fans.fans {
+        let rpm = f.rpm().map_or_else(|| "?".to_owned(), |r| r.to_string());
+        line += &format!(" {} {rpm}/{}", f.name, f.target);
+    }
+    println!("{line}");
+}
+
+/// Holds the PID file locked so only one daemon drives the fans.
+fn lock() -> Result<File> {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("t2fanrd must run as root (or use --dry-run)");
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(PID_FILE)
+        .with_context(|| format!("cannot open {PID_FILE}"))?;
+    // SAFETY: the descriptor stays open for the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("t2fanrd is already running");
+    }
+    file.set_len(0)?;
+    write!(file, "{}", std::process::id())?;
+    Ok(file)
+}
+
+/// Notices system sleep: the boot clock counts it and the monotonic clock
+/// doesn't, so their difference grows by the time slept.
+struct SleepClock {
+    gap: Duration,
+}
+
+impl SleepClock {
+    fn new() -> Self {
+        Self { gap: Self::gap() }
     }
 
-    check_pid_file()?;
-
-    let mut temp_buffer = String::new();
-
-    let fan_paths = find_fan_paths()?;
-    let fans = load_fan_configs(fan_paths)?;
-    let cpu_temp_file = find_cpu_temp_file(&mut temp_buffer)?;
-    let gpu_temp_file = find_gpu_temp_file(&mut temp_buffer)?;
-
-    println!();
-    for fan in &fans {
-        fan.set_manual(true)?;
+    fn gap() -> Duration {
+        let read = |clock| {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: ts is a valid timespec for the call to fill in.
+            unsafe { libc::clock_gettime(clock, &raw mut ts) };
+            Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+        };
+        read(libc::CLOCK_BOOTTIME).saturating_sub(read(libc::CLOCK_MONOTONIC))
     }
 
-    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_temp_file, &fans);
-    println!("T2 Fan Daemon is shutting down...");
-    for fan in fans {
-        fan.set_manual(false)?;
-    }
-
-    let pid_res = std::fs::remove_file(PID_FILE).map_err(Error::PidDelete);
-    match (res, pid_res) {
-        (Err(err), _) | (_, Err(err)) => Err(err),
-        (Ok(()), Ok(())) => Ok(()),
+    fn slept(&mut self) -> Option<Duration> {
+        let gap = Self::gap();
+        let slept = gap.saturating_sub(self.gap);
+        self.gap = gap;
+        (slept >= Duration::from_secs(1)).then_some(slept)
     }
 }
