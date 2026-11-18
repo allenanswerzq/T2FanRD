@@ -57,6 +57,20 @@ Each `[[curve]]` maps its hottest sensor from 0% of every fan's RPM range at
 | `average` | Time constant in seconds of the moving average; 0 uses each reading. |
 | `hysteresis` | Degrees a temperature must fall before the curve follows it down. |
 
+An optional `[notify]` runs a command when the fans speed up past a
+threshold, so you learn why the machine got loud. The daemon doesn't wait for
+it; `--dry-run` runs it too.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `above` | | Fan speed in percent that runs the command. |
+| `again_after` | `600` | Seconds before the command may run again. |
+| `command` | | The program and its arguments, like `["notify-send", "Fans"]`. |
+
+The command gets `T2FANRD_PERCENT` (the fan speed), `T2FANRD_REASON` (the
+curve driving the fans and its temperature, like `heatsink 59.0 C`, or the
+sensor that failed) and `T2FANRD_CURVES` (every curve) in its environment.
+
 ### NixOS
 Add this repo to your flake inputs, the module `<name-of-input>.nixosModules.t2fanrd`
 to your imports, and set `services.t2fanrd.enable = true;`. `services.t2fanrd.settings`

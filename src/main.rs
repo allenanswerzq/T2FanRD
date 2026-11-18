@@ -6,6 +6,7 @@ mod config;
 mod control;
 mod curve;
 mod fan;
+mod notify;
 mod sensor;
 
 use std::{
@@ -25,7 +26,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use signal_hook::consts::{SIGINT, SIGTERM};
 
-use crate::{config::Config, control::Control, curve::Curve, fan::Fans};
+use crate::{config::Config, control::Control, curve::Curve, fan::Fans, notify::Notifier};
 
 const PID_FILE: &str = "/run/t2fand.pid";
 const TRACE_EVERY: Duration = Duration::from_secs(1);
@@ -73,6 +74,7 @@ fn run(cli: &Cli) -> Result<()> {
         .map(Curve::open)
         .collect::<Result<Vec<_>>>()?;
     let mut control = Control::new(config.output);
+    let mut notifier = config.notify.clone().map(Notifier::new);
 
     let _lock = if cli.dry_run { None } else { Some(lock()?) };
     let stop = Arc::new(AtomicBool::new(false));
@@ -121,6 +123,23 @@ fn run(cli: &Cli) -> Result<()> {
             control.update(now, demand)
         };
         fans.set(percent, now)?;
+        if let Some(notifier) = &mut notifier {
+            notifier.update(
+                now,
+                percent,
+                || match &failure {
+                    Some(err) => format!("sensor failed: {err}"),
+                    None => hottest(&curves),
+                },
+                || {
+                    curves
+                        .iter()
+                        .map(|c| format!("{} {:.1} C {:.0}%", c.name(), c.temp, c.percent))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
+            );
+        }
 
         if (cli.trace || cli.dry_run) && traced.is_none_or(|t| now.duration_since(t) >= TRACE_EVERY)
         {
@@ -146,6 +165,14 @@ fn trace(curves: &[Curve], demand: f64, percent: f64, fans: &Fans) {
         line += &format!(" {} {rpm}/{}", f.name, f.target);
     }
     println!("{line}");
+}
+
+/// The curve asking for the most speed, with its temperature.
+fn hottest(curves: &[Curve]) -> String {
+    curves
+        .iter()
+        .max_by(|a, b| a.percent.total_cmp(&b.percent))
+        .map_or_else(String::new, |c| format!("{} {:.1} C", c.name(), c.temp))
 }
 
 /// Holds the PID file locked so only one daemon drives the fans.
