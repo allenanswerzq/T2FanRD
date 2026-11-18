@@ -20,7 +20,6 @@ pub struct Config {
     pub output: OutputConfig,
     #[serde(rename = "curve")]
     pub curves: Vec<CurveConfig>,
-    pub notify: Option<NotifyConfig>,
 }
 
 /// How the fan speed follows the hottest curve, in percent of each fan's
@@ -68,30 +67,12 @@ pub struct CurveConfig {
     pub hysteresis: f64,
 }
 
-/// A command to run when the fans speed up past `above` percent. It gets
-/// T2FANRD_PERCENT, T2FANRD_REASON (the curve that drives the fans, or the
-/// failed sensor) and T2FANRD_CURVES (every curve) in its environment.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NotifyConfig {
-    pub above: f64,
-    /// Seconds before the command may run again.
-    #[serde(default = "default_again_after")]
-    pub again_after: f64,
-    /// The program and its arguments.
-    pub command: Vec<String>,
-}
-
 fn default_interval() -> f64 {
     0.5
 }
 
 fn default_stale_after() -> f64 {
     5.0
-}
-
-fn default_again_after() -> f64 {
-    600.0
 }
 
 impl Config {
@@ -126,17 +107,6 @@ impl Config {
                 "curve {}: average and hysteresis must not be negative",
                 c.name
             );
-        }
-        if let Some(n) = &self.notify {
-            ensure!(
-                n.above > 0.0 && n.above <= 100.0,
-                "notify.above must be above 0 and at most 100"
-            );
-            ensure!(
-                n.again_after >= 0.0,
-                "notify.again_after must not be negative"
-            );
-            ensure!(!n.command.is_empty(), "notify.command must name a program");
         }
         Ok(())
     }
