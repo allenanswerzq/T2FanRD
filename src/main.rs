@@ -45,6 +45,9 @@ struct Cli {
     /// Print every sensor a curve can use, then exit.
     #[arg(long)]
     list_sensors: bool,
+    /// Hold every fan at full speed instead of following the curves.
+    #[arg(long)]
+    full_speed: bool,
 }
 
 fn main() -> ExitCode {
@@ -107,7 +110,9 @@ fn run(cli: &Cli) -> Result<()> {
                 Err(err) => failed = failed.or(Some(err)),
             }
         }
-        let percent = if let Some(err) = failed {
+        let percent = if cli.full_speed {
+            100.0
+        } else if let Some(err) = failed {
             if failure.as_ref() != Some(&err) {
                 eprintln!("Sensor failed, fans at full speed: {err}");
             }

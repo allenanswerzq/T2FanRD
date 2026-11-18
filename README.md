@@ -23,7 +23,7 @@ sensors, and the fans follow the hottest curve. The control model follows
 ## Usage
 
 ```
-t2fanrd [--config /etc/t2fanrd.toml] [--trace] [--dry-run] [--list-sensors]
+t2fanrd [--config /etc/t2fanrd.toml] [--trace] [--dry-run] [--list-sensors] [--full-speed]
 ```
 
 - `--list-sensors` prints every sensor a curve can use, as `chip:label`. The
@@ -31,6 +31,8 @@ t2fanrd [--config /etc/t2fanrd.toml] [--trace] [--dry-run] [--list-sensors]
 - `--dry-run` computes the fan speeds and prints them every second without
   touching the fans, so it runs next to the daemon and without root.
 - `--trace` prints the same lines while it controls the fans.
+- `--full-speed` holds every fan at its maximum instead of following the
+  curves, and takes the fans back after sleep like the curves do.
 
 ## Configuration
 
